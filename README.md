@@ -1,0 +1,1 @@
+# bestplay-stremio-addon
