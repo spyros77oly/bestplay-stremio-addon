@@ -1,0 +1,17 @@
+name: Keep Render Awake (24/7)
+
+on:
+  schedule:
+    - cron: '*/9 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping-health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping BestPlay Render /health
+        run: |
+          HTTP_CODE=$(curl -sS -o /tmp/health.json -w "%{http_code}" --max-time 60 "https://bestplay-stremio-addon-6wqo.onrender.com/health")
+          echo "HTTP Status: $HTTP_CODE"
+          cat /tmp/health.json
+          test "$HTTP_CODE" -eq 200
