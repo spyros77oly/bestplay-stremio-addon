@@ -120,6 +120,7 @@ function getConfig() {
   const httpTimeoutMs = Math.max(500, Math.min(6000, parseIntSetting(process.env.HTTP_TIMEOUT_MS, 4500)));
   const parsedMaxSize = Number.parseFloat(String(process.env.MAX_STREAM_SIZE_GB || '').trim());
   const maxStreamSizeGb = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 20;
+  const maxStreamResults = Math.max(1, parseIntSetting(process.env.MAX_STREAM_RESULTS, 1) || 1);
 
   return {
     port,
@@ -131,6 +132,7 @@ function getConfig() {
     cacheTtlSeconds,
     httpTimeoutMs,
     maxStreamSizeGb,
+    maxStreamResults,
   };
 }
 
@@ -323,6 +325,172 @@ async function fetchJsonWithTimeout(
           }
         );
         return stdout ? JSON.parse(stdout) : null;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  } finally {
+    clearTimeout(abortTimer);
+  }
+}
+
+function probeVideoNative(url, { signal, redirectsLeft = 5 }) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
+
+    const req = transport.request(
+      parsed,
+      {
+        method: 'GET',
+        signal,
+        headers: {
+          Range: 'bytes=0-1023',
+          'User-Agent': 'BestPlay-Stremio-Addon/10.0',
+        },
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        if (status >= 300 && status < 400 && res.headers.location && redirectsLeft > 0) {
+          res.resume();
+          const nextUrl = new URL(res.headers.location, parsed).toString();
+          probeVideoNative(nextUrl, { signal, redirectsLeft: redirectsLeft - 1 }).then(
+            resolve,
+            reject
+          );
+          return;
+        }
+
+        const contentType = String(res.headers['content-type'] || '');
+        const contentRange = String(res.headers['content-range'] || '');
+        const crMatch = contentRange.match(/bytes\s+\d+-\d+\/(\d+)/i);
+        const contentLength = Number.parseInt(String(res.headers['content-length'] || '0'), 10) || 0;
+        const totalBytes = crMatch ? Number.parseInt(crMatch[1], 10) : contentLength;
+
+        let received = 0;
+        res.on('data', (chunk) => {
+          received += chunk.length;
+          if (received >= 16) {
+            res.destroy();
+          }
+        });
+        const finish = () =>
+          resolve({
+            status,
+            effectiveUrl: url,
+            contentType,
+            contentRange,
+            totalBytes,
+            bytes: received,
+          });
+        res.once('end', finish);
+        res.once('close', finish);
+      }
+    );
+
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+function probeRedirectNative(url, { signal }) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const transport = parsed.protocol === 'https:' ? https : http;
+    const req = transport.request(
+      parsed,
+      {
+        method: 'HEAD',
+        signal,
+        headers: { 'User-Agent': 'BestPlay-Stremio-Addon/10.0' },
+      },
+      (res) => {
+        const status = res.statusCode || 0;
+        const location = res.headers.location ? new URL(res.headers.location, parsed).toString() : '';
+        res.resume();
+        resolve({ status, location });
+      }
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+/**
+ * Checks only the initial HTTP redirect Location without downloading bytes from a debrid CDN
+ * (safe for cloud hosts like Render so the user's home IP streams from Real-Debrid).
+ */
+async function probeRedirectLocation(url, { timeoutMs = 4500 } = {}) {
+  const effectiveTimeout = Math.max(500, Math.min(Number(timeoutMs) || 4500, 6000));
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), effectiveTimeout);
+  try {
+    return await probeRedirectNative(url, { signal: controller.signal });
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(abortTimer);
+  }
+}
+
+/**
+ * Probes a candidate direct video URL (following up to 5 redirects) with a 1 KB byte-range request.
+ * Returns { status, effectiveUrl, contentType, contentRange, totalBytes, bytes } or null on failure.
+ */
+async function probeVideoUrl(url, { timeoutMs = 4500 } = {}) {
+  const effectiveTimeout = Math.max(500, Math.min(Number(timeoutMs) || 4500, 6000));
+  const controller = new AbortController();
+  const abortTimer = setTimeout(() => controller.abort(), effectiveTimeout);
+
+  try {
+    return await probeVideoNative(url, { signal: controller.signal });
+  } catch (err) {
+    const msg = String(err?.message || err || '').toLowerCase();
+    const isCertOrTls =
+      msg.includes('certificate') || msg.includes('unable to verify') || msg.includes('self signed');
+
+    if (process.platform === 'win32' && isCertOrTls) {
+      try {
+        const curlMaxSec = String(Math.max(1, Math.min(6, Math.ceil(effectiveTimeout / 1000))));
+        const { stdout } = await execFileAsync(
+          'curl.exe',
+          [
+            '-sS',
+            '-L',
+            '--max-time',
+            curlMaxSec,
+            '-r',
+            '0-1023',
+            '-D',
+            '-',
+            '-o',
+            'NUL',
+            '-w',
+            '\n__DL__:%{size_download}\n__EFF__:%{url_effective}\n',
+            url,
+          ],
+          { timeout: effectiveTimeout, encoding: 'utf8', windowsHide: true }
+        );
+        const statuses = stdout.match(/HTTP\/[\d.]+\s+(\d+)/g) || [];
+        const status = statuses.length
+          ? Number.parseInt(statuses[statuses.length - 1].split(/\s+/)[1], 10)
+          : 0;
+        const ctMatches = [...stdout.matchAll(/content-type:\s*([^\r\n]+)/gi)];
+        const contentType = ctMatches.length ? ctMatches[ctMatches.length - 1][1].trim() : '';
+        const crMatches = [...stdout.matchAll(/content-range:\s*([^\r\n]+)/gi)];
+        const contentRange = crMatches.length ? crMatches[crMatches.length - 1][1].trim() : '';
+        const crTotal = contentRange.match(/bytes\s+\d+-\d+\/(\d+)/i);
+        const clMatches = [...stdout.matchAll(/content-length:\s*(\d+)/gi)];
+        const contentLength = clMatches.length
+          ? Number.parseInt(clMatches[clMatches.length - 1][1], 10)
+          : 0;
+        const totalBytes = crTotal ? Number.parseInt(crTotal[1], 10) : contentLength;
+        const dlMatch = stdout.match(/__DL__:(\d+)/);
+        const bytes = dlMatch ? Number.parseInt(dlMatch[1], 10) : 0;
+        const effMatch = stdout.match(/__EFF__:([^\r\n]+)/);
+        const effectiveUrl = effMatch ? effMatch[1].trim() : url;
+        return { status, effectiveUrl, contentType, contentRange, totalBytes, bytes };
       } catch {
         return null;
       }
@@ -632,21 +800,37 @@ const PUBLIC_TRACKER_SOURCES = [
 ];
 
 // Rejects HEVC/x265, H.266/VVC, AV1, 10bit, HDR/DV, 4K/8K, TrueHD/DTS, CAM/TS/SCR, DivX/XviD,
-// unplayable containers, hardcoded non-Greek subs, and foreign dubs.
+// unplayable containers, hardcoded non-Greek subs, and foreign dubs/personal cloud dupes.
 const UNPLAYABLE_PATTERN =
-  /(?<![a-z0-9])(x265|hevc|h\.?265|h\.?266|vvc|av1|10bit|10-bit|hi10|dv|dolby[\s._-]*vision|dovi|hdr|hdr10|hdr10plus|2160p|4k|4320p|8k|3d|divx|xvid|truehd|dts|dts-hd|dtshd|dts-ma|dts-x|dtsx|cam|hdcam|camrip|ts|hdts|telesync|pdvd|telecine|tc|scr|screener|dvdscr|workprint|hardcoded|hardsub|hardsubs|hc-?sub|hc-?subs|korsub|korsubs|burned|exyusubs|chs\.eng|sub\.ita|dubbed|multi[\s._-]*audio|multi[\s._-]*language|ita\.eng|ita\.ac3|rus\.dub|latino|lektor|dublado)(?![a-z0-9])|\.(avi|wmv|flv|m2ts|iso|ts|vob|rmvb)(?=$|[\s\]\)])/i;
+  /(?<![a-z0-9])(x265|hevc|h\.?265|h\.?266|vvc|av1|10bit|10-bit|hi10|dv|dolby[\s._-]*vision|dovi|hdr|hdr10|hdr10plus|2160p|4k|4320p|8k|3d|divx|xvid|truehd|dts|dts-hd|dtshd|dts-ma|dts-x|dtsx|cam|hdcam|camrip|ts|hdts|telesync|pdvd|telecine|tc|scr|screener|dvdscr|workprint|hardcoded|hardsub|hardsubs|hc-?sub|hc-?subs|korsub|korsubs|burned|exyusubs|chs\.eng|sub\.ita|dubbed|multi[\s._-]*audio|multi[\s._-]*language|ita\.eng|ita\.ac3|rus\.dub|rusfilm|latino|lektor|dublado|vff|vfq|truefrench|german\.dl|czech|czdub|skdub|d[ií]l)(?![a-z0-9])|\.(avi|wmv|flv|m2ts|iso|ts|vob|rmvb)(?=$|[\s\]\)])/i;
 
 const UNCACHED_DEBRID_PATTERN =
-  /(\[[A-Z]{2}\s*download\]|\buncached\b|downloading\s+to\s+debrid)/i;
+  /(\[[A-Z]{2}\s*download\]|\[RD\s*⏳\]|⏳|\buncached\b|downloading\s+to\s+debrid|not\s+cached)/i;
 
 const SAFE_HD_SIGNAL_PATTERN =
   /(?<![a-z0-9])(x264|h\.?264|avc|1080p|720p|web-?dl|webrip|bluray|brrip)(?![a-z0-9])/i;
+
+const FORBIDDEN_LOCAL_URL_PATTERN = /(localhost|127\.0\.0\.1|0\.0\.0\.0|trycloudflare\.com|sample-stream)/i;
+const PLACEHOLDER_VIDEO_URL_PATTERN =
+  /(\/status\/video\/|\/videos\/downloading|\/videos\/failed|downloading\.mp4|infringement|rate_?limit|uncached)/i;
+const REGIONAL_DUB_PENALTY_PATTERN =
+  /(?<![a-z0-9])(questione|episodio|temporada|castellano|coldfilm|descargas\d*|ita|italian|french|german|spanish|rus|hindi|hin)(?![a-z0-9])/i;
+const MIN_REAL_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB floor blocks 100KB-15MB debrid status/error videos
+
+function encodeJsonBase64(obj) {
+  return Buffer.from(JSON.stringify(obj), 'utf8').toString('base64');
+}
+
+function encodeJsonBase64Url(obj) {
+  return encodeJsonBase64(obj).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
 
 function parseAddonConfigSegment(configStr, envConfig = {}) {
   const defaults = {
     debridProvider: envConfig.debridProvider || 'realdebrid',
     apiKey: envConfig.debridApiKey || '',
     maxSizeGb: envConfig.maxStreamSizeGb || 20,
+    maxResults: envConfig.maxStreamResults || 1,
   };
 
   if (!configStr || typeof configStr !== 'string') return defaults;
@@ -687,6 +871,9 @@ function parseAddonConfigSegment(configStr, envConfig = {}) {
     } else if (cleanKey === 'maxsize') {
       const gb = Number.parseFloat(cleanVal);
       if (Number.isFinite(gb) && gb > 0) parsed.maxSizeGb = gb;
+    } else if (cleanKey === 'limit' || cleanKey === 'maxresults') {
+      const lim = Number.parseInt(cleanVal, 10);
+      if (Number.isFinite(lim) && lim >= 1 && lim <= 10) parsed.maxResults = lim;
     }
   }
   return parsed;
@@ -697,15 +884,15 @@ function extractSizeGb(text, videoSizeBytes) {
     return +(videoSizeBytes / 1024 ** 3).toFixed(2);
   }
   const match =
-    text.match(/💾\s*([\d.]+)\s*(TB|GB|MB)/i) ||
-    text.match(/(?<![a-z0-9])([\d.]+)\s*(TB|GB|MB)(?![a-z0-9])/i);
+    text.match(/💾\s*([\d.]+)\s*(TiB|GiB|MiB|TB|GB|MB)/i) ||
+    text.match(/(?<![a-z0-9])([\d.]+)\s*(TiB|GiB|MiB|TB|GB|MB)(?![a-z0-9])/i);
   if (!match) return 0;
 
   const val = Number.parseFloat(match[1]);
   if (!Number.isFinite(val)) return 0;
   const unit = match[2].toUpperCase();
-  if (unit === 'TB') return +(val * 1024).toFixed(2);
-  if (unit === 'MB') return +(val / 1024).toFixed(2);
+  if (unit === 'TB' || unit === 'TIB') return +(val * 1024).toFixed(2);
+  if (unit === 'MB' || unit === 'MIB') return +(val / 1024).toFixed(2);
   return +val.toFixed(2);
 }
 
@@ -723,9 +910,9 @@ function detectResolution(text) {
 
 function detectAudioCodec(text) {
   if (/(?<![a-z0-9])aac(?![a-z0-9])/i.test(text)) return 'AAC';
+  if (/(?<![a-z0-9])opus(?![a-z0-9])/i.test(text)) return 'OPUS';
   if (/(?<![a-z0-9])(ddp|dd\+|eac3)(?![a-z0-9])/i.test(text)) return 'DD+';
   if (/(?<![a-z0-9])(ac3|dd5\.?1)(?![a-z0-9])/i.test(text)) return 'DD 5.1';
-  if (/(?<![a-z0-9])opus(?![a-z0-9])/i.test(text)) return 'OPUS';
   return 'AAC/Stereo';
 }
 
@@ -733,31 +920,49 @@ function extractSeeders(text, streamObj) {
   if (typeof streamObj?.behaviorHints?.seeders === 'number') {
     return streamObj.behaviorHints.seeders;
   }
-  const m = text.match(/👤\s*(\d+)/);
+  const m = text.match(/(?:👤|👥)\s*(\d+)/);
   return m ? Number.parseInt(m[1], 10) : 0;
 }
 
 function detectSourceLabel(text, providerTag) {
   const engineMatch = text.match(/⚙️\s*([^\n|]+)/);
   if (engineMatch) return engineMatch[1].trim();
-  if (/torrentio/i.test(text)) return 'Torrentio';
-  if (/meteor/i.test(text)) return 'Meteor';
-  if (/mediafusion/i.test(text)) return 'MediaFusion';
-  if (/comet/i.test(text)) return 'Comet';
-  return providerTag || 'Torrentio';
+  if (/torrentio/i.test(text)) return 'Torrentio RD+';
+  if (/comet/i.test(text)) return 'Comet RD+';
+  if (/meteor/i.test(text)) return 'Meteor RD+';
+  if (/sootio/i.test(text)) return 'Sootio RD+';
+  if (/mediafusion/i.test(text)) return 'MediaFusion RD+';
+  return providerTag || 'Torrentio RD+';
+}
+
+function extractDisplayFilename(streamObj) {
+  if (streamObj?.behaviorHints?.filename) {
+    return String(streamObj.behaviorHints.filename).trim();
+  }
+  const raw = String(streamObj?.title || streamObj?.description || '');
+  const lines = raw
+    .split(/\r?\n/)
+    .map((l) => l.replace(/^[📄📁🎬⭐\s]+/, '').trim())
+    .filter(Boolean);
+  for (const line of lines) {
+    if (/\.(mp4|mkv|m4v|webm)(?:\b|$)/i.test(line)) return line;
+  }
+  return lines[0] || 'Verified.1080p.H264.RD.Stream';
 }
 
 /**
  * Strictly filters raw upstream Stremio streams and ranks H.264/AVC safe playable releases.
+ * Defaults to 1 single top stream (`maxResults = 1`) for BestPlay 1-Stream Auto-Play.
  */
 function filterAndRankStreams(
   rawStreams,
-  { hasDebrid = false, maxSizeGb = 20, maxResults = 5 } = {}
+  { hasDebrid = false, maxSizeGb = 20, maxResults = 1 } = {}
 ) {
   if (!Array.isArray(rawStreams)) {
     return {
       streams: [],
-      stats: { totalRaw: 0, totalRejected: 0, totalAccepted: 0, rejectedReasons: {} },
+      selectedMeta: [],
+      stats: { totalRaw: 0, totalRejected: 0, totalAccepted: 0, totalSafePool: 0, rejectedReasons: {} },
     };
   }
 
@@ -777,27 +982,32 @@ function filterAndRankStreams(
       recordReject('non_video_card');
       continue;
     }
-    if (hasDebrid ? !s.url : !(s.url || s.infoHash)) {
-      recordReject(hasDebrid ? 'missing_direct_url' : 'missing_source');
-      continue;
-    }
-
-    const dedupKey = s.url
-      ? `url:${s.url}`
-      : s.infoHash
-        ? `hash:${String(s.infoHash).toLowerCase()}:${s.fileIdx ?? 0}`
-        : '';
-    if (dedupKey && seenKeys.has(dedupKey)) {
-      recordReject('duplicate');
+    if (hasDebrid) {
+      if (!s.url || !/^https?:\/\//i.test(String(s.url))) {
+        recordReject('missing_direct_url');
+        continue;
+      }
+      if (FORBIDDEN_LOCAL_URL_PATTERN.test(String(s.url))) {
+        recordReject('forbidden_local_url');
+        continue;
+      }
+    } else if (!(s.url || s.infoHash)) {
+      recordReject('missing_source');
       continue;
     }
 
     const filename = s.behaviorHints?.filename ? String(s.behaviorHints.filename) : '';
     const folderName = s.behaviorHints?.folderName ? String(s.behaviorHints.folderName) : '';
-    const inspectText = `${s.name || ''} ${s.title || ''} ${s.description || ''} ${filename} ${folderName}`;
+    const bingeGroup = s.behaviorHints?.bingeGroup ? String(s.behaviorHints.bingeGroup) : '';
+    const inspectText = `${s.name || ''} ${s.title || ''} ${s.description || ''} ${filename} ${folderName} ${bingeGroup}`;
 
     if (hasDebrid && UNCACHED_DEBRID_PATTERN.test(inspectText)) {
       recordReject('uncached_debrid');
+      continue;
+    }
+
+    if (/\[cloud\]|personal/i.test(inspectText) && !/1080p|x264|h\.?264|avc/i.test(inspectText)) {
+      recordReject('personal_cloud_unverified');
       continue;
     }
 
@@ -818,42 +1028,57 @@ function filterAndRankStreams(
       continue;
     }
 
-    if (dedupKey) seenKeys.add(dedupKey);
+    const displayFile = extractDisplayFilename(s);
+    const dedupKey = s.url
+      ? `url:${s.url}`
+      : s.infoHash
+        ? `hash:${String(s.infoHash).toLowerCase()}:${s.fileIdx ?? 0}`
+        : `file:${displayFile.toLowerCase()}`;
+    if (seenKeys.has(dedupKey)) {
+      recordReject('duplicate');
+      continue;
+    }
+    seenKeys.add(dedupKey);
 
     const resolution = detectResolution(inspectText);
     const hasExplicitAvc = /(?<![a-z0-9])(x264|h\.?264|avc)(?![a-z0-9])/i.test(inspectText);
     const audioCodec = detectAudioCodec(inspectText);
-    const isMp4 = /\.mp4(?=$|[\s\]\)])/i.test(filename || inspectText);
+    const isMp4 = /\.mp4(?=$|[\s\]\)])/i.test(displayFile) || /\.mp4(?=$|[\s\]\)])/i.test(inspectText);
     const isAac = audioCodec === 'AAC';
+    const isBrowserAudioSafe = audioCodec === 'AAC' || audioCodec === 'AAC/Stereo' || audioCodec === 'OPUS';
     const seeders = extractSeeders(inspectText, s);
     const sourceLabel = detectSourceLabel(inspectText, s._sourceProvider);
-    const displayFile =
-      filename ||
-      String(s.title || s.description || '')
-        .split('\n')[0]
-        .trim() ||
-      'Verified.1080p.H264.Stream';
 
-    const hasExplicitSeedCount = /👤\s*\d+/.test(inspectText) || typeof s?.behaviorHints?.seeders === 'number';
+    const isTorrentioDirect = /torrentio\.strem\.fun/i.test(String(s.url || ''));
+    const isCometDirect = /comet/i.test(String(s.url || ''));
+    const isMeteorDirect = /meteor/i.test(String(s.url || ''));
+
+    const hasExplicitSeedCount = /(?:👤|👥)\s*\d+/.test(inspectText) || typeof s?.behaviorHints?.seeders === 'number';
     const isDeadP2p = !s.url && hasExplicitSeedCount && seeders === 0;
+    const hasRegionalDubPenalty = REGIONAL_DUB_PENALTY_PATTERN.test(inspectText);
     const score =
       (s.url ? 10000 : 0) +
-      (isDeadP2p ? -3000 : seeders >= 1 ? 600 : 0) +
-      (resolution === '1080p' ? 900 : resolution === '720p' ? 450 : 0) +
-      (hasExplicitAvc ? 300 : 0) +
-      (isMp4 ? 180 : 0) +
-      (isAac ? 150 : 0) +
-      Math.min(seeders, 1000) +
-      (sizeGb > 0 && sizeGb <= 12 ? 50 : 0);
+      (isTorrentioDirect ? 450 : isCometDirect ? 350 : isMeteorDirect ? 250 : 0) +
+      (hasRegionalDubPenalty ? -1200 : 0) +
+      (isDeadP2p ? -3000 : seeders >= 1 ? 400 : 0) +
+      (resolution === '1080p' ? 950 : resolution === '720p' ? 500 : 0) +
+      (hasExplicitAvc ? 450 : 0) +
+      (isMp4 ? 420 : 0) +
+      (isAac ? 380 : isBrowserAudioSafe ? 220 : 0) +
+      Math.min(seeders, 500) +
+      (sizeGb > 0.25 && sizeGb <= 10 ? 120 : sizeGb > 0 && sizeGb <= 20 ? 40 : 0);
 
     const statusTag = s.url ? 'Instant [RD+] HTTPS' : 'P2P Swarm H.264';
     const streamName = s.url
       ? `BestPlay [RD+] ⚡\n${resolution} · H.264`
       : `BestPlay ⚡\n${resolution} · H.264`;
 
+    const metaLineParts = [`🎬 H.264/AVC`, `🔊 ${audioCodec}`, `💾 ${formatSizeLabel(sizeGb)}`];
+    if (seeders > 0) metaLineParts.push(`👤 ${seeders}`);
+
     const formattedTitle = [
       displayFile,
-      `🎬 H.264/AVC · 🔊 ${audioCodec} · 💾 ${formatSizeLabel(sizeGb)} · 👤 ${seeders}`,
+      metaLineParts.join(' · '),
       `⚙️ ${sourceLabel} · ${statusTag}`,
     ].join('\n');
 
@@ -862,20 +1087,20 @@ function filterAndRankStreams(
       title: formattedTitle,
       behaviorHints: {
         ...(s.behaviorHints && typeof s.behaviorHints === 'object' ? s.behaviorHints : {}),
-        ...(s.url ? { notWebReady: false } : {}),
-        ...(filename ? { filename } : {}),
+        ...(s.url ? { notWebReady: true } : {}),
+        filename: filename || displayFile,
       },
     };
 
     if (s.url) normalized.url = String(s.url);
-    if (s.infoHash) {
+    if (!hasDebrid && s.infoHash) {
       normalized.infoHash = String(s.infoHash).toLowerCase();
       const existingSources = Array.isArray(s.sources) ? s.sources : [];
       normalized.sources = Array.from(
         new Set([`dht:${normalized.infoHash}`, ...existingSources, ...PUBLIC_TRACKER_SOURCES])
       );
+      if (typeof s.fileIdx === 'number') normalized.fileIdx = s.fileIdx;
     }
-    if (typeof s.fileIdx === 'number') normalized.fileIdx = s.fileIdx;
 
     candidates.push({
       score,
@@ -887,13 +1112,15 @@ function filterAndRankStreams(
         sizeLabel: formatSizeLabel(sizeGb),
         seeders,
         sourceLabel,
+        isMp4,
+        hasDirectUrl: Boolean(s.url),
       },
       stream: normalized,
     });
   }
 
   candidates.sort((a, b) => b.score - a.score);
-  const selected = candidates.slice(0, maxResults);
+  const selected = candidates.slice(0, Math.max(1, maxResults));
 
   return {
     streams: selected.map((c) => c.stream),
@@ -909,12 +1136,86 @@ function filterAndRankStreams(
 }
 
 function buildTorrentioUrl(type, id, config, hasDebrid) {
-  const parts = ['providers=yts,eztv,1337x,torrentgalaxy,thepiratebay,rarbg', 'sort=qualityseeders'];
+  const parts = [
+    'providers=yts,eztv,1337x,torrentgalaxy,thepiratebay,rarbg,kickasstorrents,magnetdl',
+    'sort=qualityseeders',
+  ];
   if (hasDebrid) {
+    parts.push('qualityfilter=4k,brremux,hdrall,dolbyvision,dolbyvisionwithhdr,threed,480p,other,scr,cam,unknown');
     parts.push('debridoptions=nodownloadlinks,nocatalog');
     parts.push(`${config.debridProvider}=${config.apiKey}`);
   }
   return `https://torrentio.strem.fun/${parts.join('|')}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+}
+
+function buildCometConfigBase64(config) {
+  return encodeJsonBase64({
+    maxResultsPerResolution: 10,
+    maxSize: 0,
+    cachedOnly: true,
+    sortCachedUncachedTogether: false,
+    removeTrash: true,
+    resultFormat: ['all'],
+    debridServices: [{ service: config.debridProvider, apiKey: config.apiKey }],
+    enableTorrent: false,
+    deduplicateStreams: true,
+    scrapeDebridAccountTorrents: false,
+    debridStreamProxyPassword: '',
+    languages: {
+      required: [],
+      allowed: [],
+      exclude: ['ru', 'fr', 'es', 'de', 'it', 'pt', 'pl', 'hi', 'tr', 'ar'],
+      preferred: ['el', 'en'],
+    },
+    resolutions: {
+      r2160p: false,
+      r1440p: false,
+      r1080p: true,
+      r720p: true,
+      r576p: false,
+      r480p: false,
+      r360p: false,
+      r240p: false,
+      unknown: false,
+    },
+  });
+}
+
+function buildMeteorUrl(type, id, config) {
+  const cfg = encodeJsonBase64Url({
+    services: [{ name: config.debridProvider, apiKey: config.apiKey }],
+    cachedOnly: true,
+    removeTrash: true,
+    removeSamples: true,
+    exclude3D: true,
+    maxResults: 25,
+    maxPerResolution: 15,
+    allowP2P: false,
+  });
+  return `https://meteorfortheweebs.midnightignite.me/${cfg}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
+}
+
+function buildSootioUrl(type, id, config) {
+  const providerName =
+    config.debridProvider === 'alldebrid'
+      ? 'AllDebrid'
+      : config.debridProvider === 'premiumize'
+        ? 'Premiumize'
+        : config.debridProvider === 'torbox'
+          ? 'TorBox'
+          : 'RealDebrid';
+  const cfg = encodeURIComponent(
+    JSON.stringify({
+      DebridServices: [{ provider: providerName, apiKey: config.apiKey }],
+      DebridProvider: providerName,
+      DebridApiKey: config.apiKey,
+      ScrapersConfigured: true,
+      minSize: 0,
+      maxSize: Math.round(config.maxSizeGb || 20),
+      ShowCatalog: false,
+    })
+  );
+  return `https://sooti.info/${cfg}/stream/${encodeURIComponent(type)}/${encodeURIComponent(id)}.json`;
 }
 
 /**
@@ -936,7 +1237,8 @@ async function handleStreamRequest({
   if (!VALID_TYPES.has(type) || !IMDB_ID_RE.test(cleanId)) {
     return {
       payload: { streams: [] },
-      stats: { totalRaw: 0, totalRejected: 0, totalAccepted: 0 },
+      stats: { totalRaw: 0, totalRejected: 0, totalAccepted: 0, totalSafePool: 0 },
+      selectedMeta: [],
       cacheHit: false,
       cacheControl: getCacheControlHeader('stream'),
     };
@@ -949,7 +1251,7 @@ async function handleStreamRequest({
       !parsedConfig.apiKey.includes('YOUR_')
   );
 
-  const cacheKey = `stream:${hasDebrid ? parsedConfig.debridProvider : 'p2p'}:${parsedConfig.maxSizeGb}:${type}:${cleanId}`;
+  const cacheKey = `stream:${hasDebrid ? parsedConfig.debridProvider : 'p2p'}:${parsedConfig.maxSizeGb}:${parsedConfig.maxResults}:${type}:${cleanId}`;
   if (!simulateTimeout && cache) {
     const cached = cache.get(cacheKey);
     if (cached) {
@@ -964,18 +1266,41 @@ async function handleStreamRequest({
   }
 
   const timeoutBudget = Math.min(Number(httpTimeoutMs) || 4500, 5500);
-  const torrentioUrl = buildTorrentioUrl(type, cleanId, parsedConfig, hasDebrid);
+  const encodedType = encodeURIComponent(type);
+  const encodedId = encodeURIComponent(cleanId);
 
   const upstreamRequests = [
-    fetchJsonWithTimeout(torrentioUrl, { timeoutMs: timeoutBudget, simulateTimeout }).then((d) => ({
-      provider: 'Torrentio',
+    fetchJsonWithTimeout(buildTorrentioUrl(type, cleanId, parsedConfig, hasDebrid), {
+      timeoutMs: timeoutBudget,
+      simulateTimeout,
+    }).then((d) => ({
+      provider: hasDebrid ? 'Torrentio RD+' : 'Torrentio',
       data: d,
     })),
   ];
 
-  // Query AIOStreams Safe Pool as secondary live source in non-Debrid mode (or when custom RD URL isn't overriding)
-  if (!hasDebrid) {
-    const aioUrl = `${PREBUILT_BESTPLAY_SAFE_P2P_BASE}/stream/${encodeURIComponent(type)}/${encodeURIComponent(cleanId)}.json`;
+  if (hasDebrid) {
+    const cometCfg = buildCometConfigBase64(parsedConfig);
+    upstreamRequests.push(
+      fetchJsonWithTimeout(
+        `https://comet.elfhosted.com/${cometCfg}/stream/${encodedType}/${encodedId}.json`,
+        { timeoutMs: timeoutBudget, simulateTimeout }
+      ).then((d) => ({ provider: 'Comet ElfHosted RD+', data: d })),
+      fetchJsonWithTimeout(
+        `https://cometfortheweebs.midnightignite.me/${cometCfg}/stream/${encodedType}/${encodedId}.json`,
+        { timeoutMs: timeoutBudget, simulateTimeout }
+      ).then((d) => ({ provider: 'Comet Midnight RD+', data: d })),
+      fetchJsonWithTimeout(buildMeteorUrl(type, cleanId, parsedConfig), {
+        timeoutMs: timeoutBudget,
+        simulateTimeout,
+      }).then((d) => ({ provider: 'Meteor RD+', data: d })),
+      fetchJsonWithTimeout(buildSootioUrl(type, cleanId, parsedConfig), {
+        timeoutMs: Math.min(timeoutBudget, 4000),
+        simulateTimeout,
+      }).then((d) => ({ provider: 'Sootio RD+', data: d }))
+    );
+  } else {
+    const aioUrl = `${PREBUILT_BESTPLAY_SAFE_P2P_BASE}/stream/${encodedType}/${encodedId}.json`;
     upstreamRequests.push(
       fetchJsonWithTimeout(aioUrl, { timeoutMs: timeoutBudget, simulateTimeout }).then((d) => ({
         provider: 'AIOStreams Safe',
@@ -995,25 +1320,115 @@ async function handleStreamRequest({
     }
   }
 
+  const desiredCount = Math.max(1, parsedConfig.maxResults || 1);
+  const poolLimit = hasDebrid ? Math.max(desiredCount * 6, 8) : desiredCount;
   const filtered = filterAndRankStreams(mergedRawStreams, {
     hasDebrid,
     maxSizeGb: parsedConfig.maxSizeGb,
-    maxResults: 5,
+    maxResults: poolLimit,
   });
 
-  const payload = { streams: filtered.streams };
-  if (!simulateTimeout && cache && filtered.streams.length > 0) {
+  let finalStreams = filtered.streams;
+  let finalMeta = filtered.selectedMeta;
+  let rejectedUnverifiedDebrid = 0;
+
+  // Live server-side Real-Debrid verification:
+  // - On cloud/Render (process.env.RENDER): verify 302 Location redirects to a real debrid CDN host without downloading bytes from cloud IP.
+  // - Locally: follow redirects with Range: bytes=0-1023 and assert >= 50 MB real video file (blocking placeholder downloading.mp4 videos).
+  if (hasDebrid && !simulateTimeout && filtered.streams.length > 0) {
+    const isCloudRender = Boolean(process.env.RENDER);
+    const verifiedStreams = [];
+    const verifiedMeta = [];
+    for (let i = 0; i < filtered.streams.length && verifiedStreams.length < desiredCount; i++) {
+      const candidate = filtered.streams[i];
+      const meta = filtered.selectedMeta[i] || {};
+
+      if (isCloudRender) {
+        const redir = await probeRedirectLocation(candidate.url, { timeoutMs: Math.min(timeoutBudget, 4500) });
+        const loc = redir?.location || '';
+        const redirectsToRealDebridCdn =
+          redir &&
+          redir.status >= 300 &&
+          redir.status < 400 &&
+          /real-debrid\.com|alldebrid\.com|premiumize\.me|torbox\.app/i.test(loc) &&
+          !PLACEHOLDER_VIDEO_URL_PATTERN.test(loc);
+
+        if (redirectsToRealDebridCdn) {
+          verifiedStreams.push({
+            ...candidate,
+            behaviorHints: {
+              ...(candidate.behaviorHints || {}),
+              notWebReady: true,
+            },
+          });
+          verifiedMeta.push({ ...meta, verifiedRedirect: true });
+        } else {
+          rejectedUnverifiedDebrid += 1;
+        }
+        continue;
+      }
+
+      const probe = await probeVideoUrl(candidate.url, { timeoutMs: Math.min(timeoutBudget, 4500) });
+      const isOkStatus = probe && (probe.status === 200 || probe.status === 206);
+      const isCleanUrl =
+        probe &&
+        /^https?:\/\//i.test(probe.effectiveUrl) &&
+        !FORBIDDEN_LOCAL_URL_PATTERN.test(probe.effectiveUrl) &&
+        !PLACEHOLDER_VIDEO_URL_PATTERN.test(probe.effectiveUrl);
+      const isRealFileSize = probe && probe.totalBytes >= MIN_REAL_VIDEO_BYTES;
+      const withinMaxSize =
+        probe && probe.totalBytes <= (parsedConfig.maxSizeGb || 20) * 1024 ** 3 * 1.02;
+
+      if (isOkStatus && isCleanUrl && isRealFileSize && withinMaxSize) {
+        const verifiedSizeGb = +(probe.totalBytes / 1024 ** 3).toFixed(2);
+        const verifiedSizeLabel = formatSizeLabel(verifiedSizeGb);
+        const updatedTitle = candidate.title.replace(/💾\s*[^·\n]+/, `💾 ${verifiedSizeLabel} `);
+        verifiedStreams.push({
+          ...candidate,
+          url: probe.effectiveUrl,
+          title: updatedTitle.replace(/\s+·/g, ' ·'),
+          behaviorHints: {
+            ...(candidate.behaviorHints || {}),
+            notWebReady: true,
+            videoSize: probe.totalBytes,
+          },
+        });
+        verifiedMeta.push({
+          ...meta,
+          sizeGb: verifiedSizeGb,
+          sizeLabel: verifiedSizeLabel,
+          verifiedHttpStatus: probe.status,
+          verifiedTotalBytes: probe.totalBytes,
+          verifiedContentType: probe.contentType,
+        });
+      } else {
+        rejectedUnverifiedDebrid += 1;
+      }
+    }
+    finalStreams = verifiedStreams;
+    finalMeta = verifiedMeta;
+  }
+
+  const finalStats = {
+    ...filtered.stats,
+    totalRejected: filtered.stats.totalRejected + rejectedUnverifiedDebrid,
+    totalAccepted: finalStreams.length,
+    rejectedUnverifiedDebrid,
+  };
+
+  const payload = { streams: finalStreams };
+  if (!simulateTimeout && cache && finalStreams.length > 0) {
     cache.set(
       cacheKey,
-      { payload, stats: filtered.stats, selectedMeta: filtered.selectedMeta },
+      { payload, stats: finalStats, selectedMeta: finalMeta },
       cacheTtlMs
     );
   }
 
   return {
     payload,
-    stats: filtered.stats,
-    selectedMeta: filtered.selectedMeta,
+    stats: finalStats,
+    selectedMeta: finalMeta,
     cacheHit: false,
     cacheControl: getCacheControlHeader('stream'),
   };
