@@ -401,14 +401,17 @@ function probeRedirectNative(url, { signal }) {
     const req = transport.request(
       parsed,
       {
-        method: 'HEAD',
+        method: 'GET',
         signal,
-        headers: { 'User-Agent': 'BestPlay-Stremio-Addon/10.0' },
+        headers: {
+          Range: 'bytes=0-0',
+          'User-Agent': 'BestPlay-Stremio-Addon/10.0',
+        },
       },
       (res) => {
         const status = res.statusCode || 0;
         const location = res.headers.location ? new URL(res.headers.location, parsed).toString() : '';
-        res.resume();
+        res.destroy();
         resolve({ status, location });
       }
     );
@@ -807,8 +810,9 @@ const FOREIGN_DUB_PATTERN =
 const HARD_UNPLAYABLE_PATTERN =
   /(?<![a-z0-9])(h\.?266|vvc|av1|10bit|10-bit|hi10|dv|dolby[\s._-]*vision|dovi|hdr|hdr10|hdr10plus|4320p|8k|3d|divx|xvid|truehd|dts|dts-hd|dtshd|dts-ma|dts-x|dtsx|cam|hdcam|camrip|ts|hdts|telesync|pdvd|telecine|tc|scr|screener|dvdscr|workprint|exyusubs|chs\.eng)(?![a-z0-9])|\.(avi|wmv|flv|m2ts|iso|ts|vob|rmvb)(?=$|[\s\]\)])/i;
 
-// Blocked in Tier-1 & Tier-2; allowed ONLY in Tier-3 last-resort when zero clean-sub original-audio cached streams exist on Real-Debrid.
-const HARDCODED_SUBS_PATTERN = /(?<![a-z0-9])(hardcoded|hardsub|hardsubs|hc-?sub|hc-?subs|korsub|korsubs|burned)(?![a-z0-9])/i;
+// Blocked in Tier-1 & Tier-2: burned-in/hardcoded subtitles & Israeli broadcast UHDTV rips (which burn Hebrew subs into video pixels).
+const HARDCODED_SUBS_PATTERN =
+  /(?<![a-z0-9])(hardcoded|hardsub|hardsubs|hc-?sub|hc-?subs|korsub|korsubs|burned|uhdtv|sweet[\s._-]*star)(?![a-z0-9])/i;
 
 // Blocked in Tier-1 (Strict H.264/AVC Safe Mode); allowed ONLY in Tier-2 Original-Audio fallback when zero H.264 original-language streams exist.
 const HEVC_OR_4K_PATTERN = /(?<![a-z0-9])(x265|hevc|h\.?265|2160p|4k)(?![a-z0-9])/i;
@@ -1499,7 +1503,7 @@ async function handleStreamRequest({
 
   const verifyDebridPool = async (poolResult) => {
     const isCloudRender = Boolean(process.env.RENDER);
-    const probeTimeoutMs = Math.min(timeoutBudget, 3500);
+    const probeTimeoutMs = isCloudRender ? 5500 : Math.min(timeoutBudget, 3500);
     const verifiedStreams = [];
     const verifiedMeta = [];
     let rejectedCount = 0;
@@ -1584,8 +1588,15 @@ async function handleStreamRequest({
       }
     }
 
-    finalStreams = pass1.verifiedStreams;
-    finalMeta = pass1.verifiedMeta;
+    // Cloud safety net: if every redirect probe timed out on Render's shared IP (e.g., upstream resolver slowness)
+    // but Tier-1 already returned verified cached [RD+] candidates from Torrentio/Comet, return the top candidate cleanly.
+    if (Boolean(process.env.RENDER) && pass1.verifiedStreams.length === 0 && filtered.streams.length > 0) {
+      finalStreams = filtered.streams.slice(0, desiredCount);
+      finalMeta = filtered.selectedMeta.slice(0, desiredCount);
+    } else {
+      finalStreams = pass1.verifiedStreams;
+      finalMeta = pass1.verifiedMeta;
+    }
   }
 
   const finalStats = {
