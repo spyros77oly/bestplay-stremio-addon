@@ -1,0 +1,14 @@
+{
+  "name": "bestplay-stremio-addon",
+  "version": "10.0.0",
+  "private": true,
+  "type": "module",
+  "description": "BestPlay Universal Stremio Addon (1080p AVC Playable Streams & Synced Greek Subtitles)",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-suite.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
