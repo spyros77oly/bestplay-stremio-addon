@@ -119,7 +119,7 @@ function getConfig() {
   const cacheTtlSeconds = Math.max(10, parseIntSetting(process.env.CACHE_TTL_SECONDS, 300));
   const httpTimeoutMs = Math.max(500, Math.min(6000, parseIntSetting(process.env.HTTP_TIMEOUT_MS, 4500)));
   const parsedMaxSize = Number.parseFloat(String(process.env.MAX_STREAM_SIZE_GB || '').trim());
-  const maxStreamSizeGb = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 20;
+  const maxStreamSizeGb = Number.isFinite(parsedMaxSize) && parsedMaxSize > 0 ? parsedMaxSize : 22;
   const maxStreamResults = Math.max(1, parseIntSetting(process.env.MAX_STREAM_RESULTS, 1) || 1);
 
   return {
@@ -799,22 +799,31 @@ const PUBLIC_TRACKER_SOURCES = [
   'tracker:udp://exodus.desync.com:6969/announce',
 ];
 
-// Rejects HEVC/x265, H.266/VVC, AV1, 10bit, HDR/DV, 4K/8K, TrueHD/DTS, CAM/TS/SCR, DivX/XviD,
-// unplayable containers, hardcoded non-Greek subs, and foreign dubs/personal cloud dupes.
-const UNPLAYABLE_PATTERN =
-  /(?<![a-z0-9])(x265|hevc|h\.?265|h\.?266|vvc|av1|10bit|10-bit|hi10|dv|dolby[\s._-]*vision|dovi|hdr|hdr10|hdr10plus|2160p|4k|4320p|8k|3d|divx|xvid|truehd|dts|dts-hd|dtshd|dts-ma|dts-x|dtsx|cam|hdcam|camrip|ts|hdts|telesync|pdvd|telecine|tc|scr|screener|dvdscr|workprint|hardcoded|hardsub|hardsubs|hc-?sub|hc-?subs|korsub|korsubs|burned|exyusubs|chs\.eng|sub\.ita|dubbed|multi[\s._-]*audio|multi[\s._-]*language|ita\.eng|ita\.ac3|rus\.dub|rusfilm|latino|lektor|dublado|vff|vfq|truefrench|german\.dl|czech|czdub|skdub|d[ií]l)(?![a-z0-9])|\.(avi|wmv|flv|m2ts|iso|ts|vob|rmvb)(?=$|[\s\]\)])/i;
+// Always hard-blocked in every mode: foreign dubs, dub studios, Cyrillic/regional dubbed packs.
+const FOREIGN_DUB_PATTERN =
+  /(?<![a-z0-9])(dubbed|dub|multi[\s._-]*audio|multi[\s._-]*language|ita\.eng|ita\.ac3|sub\.ita|episodio|questione|pir8|odyssey|coldfilm|rusfilm|sunshinestudio|newstudio|lostfilm|baibako|kubik|hdrezka|alexfilm|rutor|rus\.dub|castellano|mejortorrent|descargas\d*|temporada|latino|lektor|dublado|vff|vfq|truefrench|german\.dl|czech|czdub|skdub|d[ií]l|bgaudio|4play)(?![a-z0-9])|[\u0400-\u04FF]|🇷🇺|🇪🇸|🇲🇽|🇮🇹|🇧🇬|🇵🇱|🇹🇷|🇮🇳|🇨🇿|🇸🇰|🇩🇪|🇵🇹|🇧🇷/i;
+
+// Always hard-blocked in every mode: unplayable containers, amateur captures, AV1, lossless audio.
+const HARD_UNPLAYABLE_PATTERN =
+  /(?<![a-z0-9])(h\.?266|vvc|av1|10bit|10-bit|hi10|dv|dolby[\s._-]*vision|dovi|hdr|hdr10|hdr10plus|4320p|8k|3d|divx|xvid|truehd|dts|dts-hd|dtshd|dts-ma|dts-x|dtsx|cam|hdcam|camrip|ts|hdts|telesync|pdvd|telecine|tc|scr|screener|dvdscr|workprint|exyusubs|chs\.eng)(?![a-z0-9])|\.(avi|wmv|flv|m2ts|iso|ts|vob|rmvb)(?=$|[\s\]\)])/i;
+
+// Blocked in Tier-1 & Tier-2; allowed ONLY in Tier-3 last-resort when zero clean-sub original-audio cached streams exist on Real-Debrid.
+const HARDCODED_SUBS_PATTERN = /(?<![a-z0-9])(hardcoded|hardsub|hardsubs|hc-?sub|hc-?subs|korsub|korsubs|burned)(?![a-z0-9])/i;
+
+// Blocked in Tier-1 (Strict H.264/AVC Safe Mode); allowed ONLY in Tier-2 Original-Audio fallback when zero H.264 original-language streams exist.
+const HEVC_OR_4K_PATTERN = /(?<![a-z0-9])(x265|hevc|h\.?265|2160p|4k)(?![a-z0-9])/i;
 
 const UNCACHED_DEBRID_PATTERN =
   /(\[[A-Z]{2}\s*download\]|\[RD\s*⏳\]|⏳|\buncached\b|downloading\s+to\s+debrid|not\s+cached)/i;
 
 const SAFE_HD_SIGNAL_PATTERN =
-  /(?<![a-z0-9])(x264|h\.?264|avc|1080p|720p|web-?dl|webrip|bluray|brrip)(?![a-z0-9])/i;
+  /(?<![a-z0-9])(x264|h\.?264|avc|1080p|720p|web-?dl|webrip|bluray|brrip|web)(?![a-z0-9])/i;
 
 const FORBIDDEN_LOCAL_URL_PATTERN = /(localhost|127\.0\.0\.1|0\.0\.0\.0|trycloudflare\.com|sample-stream)/i;
 const PLACEHOLDER_VIDEO_URL_PATTERN =
-  /(\/status\/video\/|\/videos\/downloading|\/videos\/failed|downloading\.mp4|infringement|rate_?limit|uncached)/i;
+  /(\/status\/video\/|\/videos\/downloading|\/videos\/failed|downloading\.mp4|slate\.elfhosted\.com|infringement|rate_?limit|uncached)/i;
 const REGIONAL_DUB_PENALTY_PATTERN =
-  /(?<![a-z0-9])(questione|episodio|temporada|castellano|coldfilm|descargas\d*|ita|italian|french|german|spanish|rus|hindi|hin)(?![a-z0-9])/i;
+  /(?<![a-z0-9])(multi|dual|ita|italian|french|german|spanish|rus|hindi|hin)(?![a-z0-9])|🇫🇷/i;
 const MIN_REAL_VIDEO_BYTES = 50 * 1024 * 1024; // 50 MB floor blocks 100KB-15MB debrid status/error videos
 
 function encodeJsonBase64(obj) {
@@ -825,11 +834,55 @@ function encodeJsonBase64Url(obj) {
   return encodeJsonBase64(obj).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
 }
 
+const MICRO_COMPRESS_PATTERN = /(?<![a-z0-9])(yify|yts|psa|galaxyrg|pahe|megusta|etrg|rarbg[\s._-]*2gb)(?![a-z0-9])/i;
+const SOURCE_BLURAY_REMUX_PATTERN = /(?<![a-z0-9])(remux)(?![a-z0-9])/i;
+const SOURCE_BLURAY_PATTERN = /(?<![a-z0-9])(bluray|blu-ray|bdrip|bdremux)(?![a-z0-9])/i;
+const SOURCE_WEBDL_PATTERN = /(?<![a-z0-9])(web-?dl|nf[\s._-]*web|amzn[\s._-]*web|atvp|dsnp|hmax)(?![a-z0-9])/i;
+const SOURCE_WEBRIP_PATTERN = /(?<![a-z0-9])(webrip|brrip)(?![a-z0-9])/i;
+const SOURCE_HDTV_PATTERN = /(?<![a-z0-9])(hdtv|pdtv)(?![a-z0-9])/i;
+
+function detectSourceQuality(text) {
+  if (SOURCE_BLURAY_REMUX_PATTERN.test(text)) return { label: 'BluRay REMUX', score: 1050 };
+  if (SOURCE_BLURAY_PATTERN.test(text)) return { label: 'BluRay', score: 900 };
+  if (SOURCE_WEBDL_PATTERN.test(text)) return { label: 'WEB-DL', score: 650 };
+  if (SOURCE_WEBRIP_PATTERN.test(text)) return { label: 'WEBRip', score: 300 };
+  if (SOURCE_HDTV_PATTERN.test(text)) return { label: 'HDTV', score: 120 };
+  return { label: 'HD', score: 180 };
+}
+
+function scoreBitrateQuality(sizeGb, mediaType, isMicroCompressed) {
+  let score = 0;
+  if (mediaType === 'series') {
+    if (sizeGb >= 1.5 && sizeGb <= 6) {
+      score += 1200 + Math.round(sizeGb * 130);
+    } else if (sizeGb > 6 && sizeGb <= 12) {
+      score += 1100 + Math.round(Math.min(sizeGb, 12) * 65);
+    } else if (sizeGb >= 0.8 && sizeGb < 1.5) {
+      score += 400 + Math.round(sizeGb * 100);
+    } else if (sizeGb > 0 && sizeGb < 0.8) {
+      score -= 800;
+    }
+  } else {
+    // Movies: prefer crisp high-bitrate 4 GB - 22 GB BluRay/WEB-DL releases over tiny rips
+    if (sizeGb >= 4 && sizeGb <= 22) {
+      score += 1400 + Math.round(sizeGb * 60);
+    } else if (sizeGb >= 2.5 && sizeGb < 4) {
+      score += 450 + Math.round(sizeGb * 50);
+    } else if (sizeGb > 0 && sizeGb < 2.5) {
+      score -= 1000;
+    }
+  }
+  if (isMicroCompressed) {
+    score -= 900;
+  }
+  return score;
+}
+
 function parseAddonConfigSegment(configStr, envConfig = {}) {
   const defaults = {
     debridProvider: envConfig.debridProvider || 'realdebrid',
     apiKey: envConfig.debridApiKey || '',
-    maxSizeGb: envConfig.maxStreamSizeGb || 20,
+    maxSizeGb: envConfig.maxStreamSizeGb || 22,
     maxResults: envConfig.maxStreamResults || 1,
   };
 
@@ -903,9 +956,15 @@ function formatSizeLabel(sizeGb) {
 }
 
 function detectResolution(text) {
+  if (/(?<![a-z0-9])(2160p|4k)(?![a-z0-9])/i.test(text)) return '4K';
   if (/(?<![a-z0-9])1080p(?![a-z0-9])/i.test(text)) return '1080p';
   if (/(?<![a-z0-9])720p(?![a-z0-9])/i.test(text)) return '720p';
   return 'HD';
+}
+
+function detectVideoCodec(text) {
+  if (/(?<![a-z0-9])(x265|hevc|h\.?265)(?![a-z0-9])/i.test(text)) return 'H.265/HEVC';
+  return 'H.264/AVC';
 }
 
 function detectAudioCodec(text) {
@@ -956,7 +1015,14 @@ function extractDisplayFilename(streamObj) {
  */
 function filterAndRankStreams(
   rawStreams,
-  { hasDebrid = false, maxSizeGb = 20, maxResults = 1 } = {}
+  {
+    type = 'movie',
+    hasDebrid = false,
+    maxSizeGb = 22,
+    maxResults = 1,
+    allowOriginalHevcFallback = false,
+    allowHardcodedSubFallback = false,
+  } = {}
 ) {
   if (!Array.isArray(rawStreams)) {
     return {
@@ -1011,13 +1077,31 @@ function filterAndRankStreams(
       continue;
     }
 
-    const unplayableMatch = inspectText.match(UNPLAYABLE_PATTERN);
-    if (unplayableMatch) {
-      recordReject(`blocked_${unplayableMatch[0].toLowerCase()}`);
+    const dubMatch = inspectText.match(FOREIGN_DUB_PATTERN);
+    if (dubMatch) {
+      recordReject(`blocked_dub_${dubMatch[0].toLowerCase()}`);
       continue;
     }
 
-    if (!SAFE_HD_SIGNAL_PATTERN.test(inspectText)) {
+    const hardMatch = inspectText.match(HARD_UNPLAYABLE_PATTERN);
+    if (hardMatch) {
+      recordReject(`blocked_${hardMatch[0].toLowerCase()}`);
+      continue;
+    }
+
+    const hcMatch = inspectText.match(HARDCODED_SUBS_PATTERN);
+    if (hcMatch && !allowHardcodedSubFallback) {
+      recordReject(`blocked_${hcMatch[0].toLowerCase()}`);
+      continue;
+    }
+
+    const hevcOr4kMatch = inspectText.match(HEVC_OR_4K_PATTERN);
+    if (hevcOr4kMatch && !allowOriginalHevcFallback) {
+      recordReject(`blocked_${hevcOr4kMatch[0].toLowerCase()}`);
+      continue;
+    }
+
+    if (!SAFE_HD_SIGNAL_PATTERN.test(inspectText) && !allowOriginalHevcFallback && !allowHardcodedSubFallback) {
       recordReject('missing_hd_avc_signal');
       continue;
     }
@@ -1041,11 +1125,13 @@ function filterAndRankStreams(
     seenKeys.add(dedupKey);
 
     const resolution = detectResolution(inspectText);
+    const videoCodec = detectVideoCodec(inspectText);
+    const shortCodec = videoCodec === 'H.265/HEVC' ? 'HEVC' : 'H.264';
+    const sourceQuality = detectSourceQuality(inspectText);
     const hasExplicitAvc = /(?<![a-z0-9])(x264|h\.?264|avc)(?![a-z0-9])/i.test(inspectText);
     const audioCodec = detectAudioCodec(inspectText);
     const isMp4 = /\.mp4(?=$|[\s\]\)])/i.test(displayFile) || /\.mp4(?=$|[\s\]\)])/i.test(inspectText);
-    const isAac = audioCodec === 'AAC';
-    const isBrowserAudioSafe = audioCodec === 'AAC' || audioCodec === 'AAC/Stereo' || audioCodec === 'OPUS';
+    const isMicroCompressed = MICRO_COMPRESS_PATTERN.test(inspectText);
     const seeders = extractSeeders(inspectText, s);
     const sourceLabel = detectSourceLabel(inspectText, s._sourceProvider);
 
@@ -1056,24 +1142,40 @@ function filterAndRankStreams(
     const hasExplicitSeedCount = /(?:👤|👥)\s*\d+/.test(inspectText) || typeof s?.behaviorHints?.seeders === 'number';
     const isDeadP2p = !s.url && hasExplicitSeedCount && seeders === 0;
     const hasRegionalDubPenalty = REGIONAL_DUB_PENALTY_PATTERN.test(inspectText);
+    const isPureOriginalFlag = /🇮🇱|🇬🇧|🇺🇸|original|hebrew/i.test(inspectText) && !/🇫🇷|multi/i.test(inspectText);
+
+    const bitrateScore = scoreBitrateQuality(sizeGb, type, isMicroCompressed);
+    const audioScore =
+      audioCodec === 'DD+' || audioCodec === 'DD 5.1'
+        ? 180
+        : audioCodec === 'AAC'
+          ? 150
+          : audioCodec === 'OPUS'
+            ? 120
+            : 80;
+
+    // Maximum Safe Quality ranking: Resolution (1080p) > High-Bitrate Sweet Spot (4-22GB Movie / 1.5-6GB Series)
+    // > Source Quality (BluRay/REMUX > WEB-DL > WEBRip > HDTV) > Explicit H.264 > Audio > MP4 tie-breaker.
     const score =
       (s.url ? 10000 : 0) +
-      (isTorrentioDirect ? 450 : isCometDirect ? 350 : isMeteorDirect ? 250 : 0) +
-      (hasRegionalDubPenalty ? -1200 : 0) +
-      (isDeadP2p ? -3000 : seeders >= 1 ? 400 : 0) +
-      (resolution === '1080p' ? 950 : resolution === '720p' ? 500 : 0) +
-      (hasExplicitAvc ? 450 : 0) +
-      (isMp4 ? 420 : 0) +
-      (isAac ? 380 : isBrowserAudioSafe ? 220 : 0) +
-      Math.min(seeders, 500) +
-      (sizeGb > 0.25 && sizeGb <= 10 ? 120 : sizeGb > 0 && sizeGb <= 20 ? 40 : 0);
+      (resolution === '1080p' ? 1500 : resolution === '4K' ? 900 : resolution === '720p' ? 400 : 0) +
+      bitrateScore +
+      sourceQuality.score +
+      (hasExplicitAvc ? 300 : 0) +
+      audioScore +
+      (isMp4 ? 60 : 0) +
+      (isPureOriginalFlag ? 500 : 0) +
+      (hasRegionalDubPenalty ? -700 : 0) +
+      (isTorrentioDirect ? 140 : isCometDirect ? 110 : isMeteorDirect ? 80 : 0) +
+      (isDeadP2p ? -3000 : 0) +
+      Math.min(seeders, 120);
 
-    const statusTag = s.url ? 'Instant [RD+] HTTPS' : 'P2P Swarm H.264';
+    const statusTag = s.url ? `Instant [RD+] HTTPS · ${sourceQuality.label} · Original Audio` : 'P2P Swarm H.264';
     const streamName = s.url
-      ? `BestPlay [RD+] ⚡\n${resolution} · H.264`
-      : `BestPlay ⚡\n${resolution} · H.264`;
+      ? `BestPlay [RD+] ⚡\n${resolution} · ${shortCodec}`
+      : `BestPlay ⚡\n${resolution} · ${shortCodec}`;
 
-    const metaLineParts = [`🎬 H.264/AVC`, `🔊 ${audioCodec}`, `💾 ${formatSizeLabel(sizeGb)}`];
+    const metaLineParts = [`🎬 ${videoCodec}`, `🔊 ${audioCodec}`, `💾 ${formatSizeLabel(sizeGb)}`];
     if (seeders > 0) metaLineParts.push(`👤 ${seeders}`);
 
     const formattedTitle = [
@@ -1106,8 +1208,9 @@ function filterAndRankStreams(
       score,
       meta: {
         resolution,
-        videoCodec: 'H.264/AVC',
+        videoCodec,
         audioCodec,
+        sourceQuality: sourceQuality.label,
         sizeGb,
         sizeLabel: formatSizeLabel(sizeGb),
         seeders,
@@ -1138,10 +1241,10 @@ function filterAndRankStreams(
 function buildTorrentioUrl(type, id, config, hasDebrid) {
   const parts = [
     'providers=yts,eztv,1337x,torrentgalaxy,thepiratebay,rarbg,kickasstorrents,magnetdl',
-    'sort=qualityseeders',
+    hasDebrid ? 'sort=qualitysize' : 'sort=qualityseeders',
   ];
   if (hasDebrid) {
-    parts.push('qualityfilter=4k,brremux,hdrall,dolbyvision,dolbyvisionwithhdr,threed,480p,other,scr,cam,unknown');
+    parts.push('qualityfilter=4k,hdrall,dolbyvision,dolbyvisionwithhdr,threed,480p,other,scr,cam,unknown');
     parts.push('debridoptions=nodownloadlinks,nocatalog');
     parts.push(`${config.debridProvider}=${config.apiKey}`);
   }
@@ -1322,91 +1425,167 @@ async function handleStreamRequest({
 
   const desiredCount = Math.max(1, parsedConfig.maxResults || 1);
   const poolLimit = hasDebrid ? Math.max(desiredCount * 6, 8) : desiredCount;
-  const filtered = filterAndRankStreams(mergedRawStreams, {
+  let filtered = filterAndRankStreams(mergedRawStreams, {
+    type,
     hasDebrid,
     maxSizeGb: parsedConfig.maxSizeGb,
     maxResults: poolLimit,
+    allowOriginalHevcFallback: false,
   });
+
+  const alreadyProbedUrls = new Set();
+
+  const verifySingleCandidate = async (candidate, meta, isCloudRender, probeTimeoutMs) => {
+    if (isCloudRender) {
+      const redir = await probeRedirectLocation(candidate.url, { timeoutMs: probeTimeoutMs });
+      const loc = redir?.location || '';
+      const redirectsToRealDebridCdn =
+        redir &&
+        redir.status >= 300 &&
+        redir.status < 400 &&
+        /real-debrid\.com|alldebrid\.com|premiumize\.me|torbox\.app/i.test(loc) &&
+        !PLACEHOLDER_VIDEO_URL_PATTERN.test(loc);
+
+      if (!redirectsToRealDebridCdn) return null;
+      return {
+        stream: {
+          ...candidate,
+          behaviorHints: {
+            ...(candidate.behaviorHints || {}),
+            notWebReady: true,
+          },
+        },
+        meta: { ...meta, verifiedRedirect: true },
+      };
+    }
+
+    const probe = await probeVideoUrl(candidate.url, { timeoutMs: probeTimeoutMs });
+    const isOkStatus = probe && (probe.status === 200 || probe.status === 206);
+    const isCleanUrl =
+      probe &&
+      /^https?:\/\//i.test(probe.effectiveUrl) &&
+      !FORBIDDEN_LOCAL_URL_PATTERN.test(probe.effectiveUrl) &&
+      !PLACEHOLDER_VIDEO_URL_PATTERN.test(probe.effectiveUrl);
+    const isRealFileSize = probe && probe.totalBytes >= MIN_REAL_VIDEO_BYTES;
+    const withinMaxSize =
+      probe && probe.totalBytes <= (parsedConfig.maxSizeGb || 22) * 1024 ** 3 * 1.02;
+
+    if (!isOkStatus || !isCleanUrl || !isRealFileSize || !withinMaxSize) return null;
+
+    const verifiedSizeGb = +(probe.totalBytes / 1024 ** 3).toFixed(2);
+    const verifiedSizeLabel = formatSizeLabel(verifiedSizeGb);
+    const updatedTitle = candidate.title.replace(/💾\s*[^·\n]+/, `💾 ${verifiedSizeLabel} `);
+    return {
+      stream: {
+        ...candidate,
+        url: probe.effectiveUrl,
+        title: updatedTitle.replace(/\s+·/g, ' ·'),
+        behaviorHints: {
+          ...(candidate.behaviorHints || {}),
+          notWebReady: true,
+          videoSize: probe.totalBytes,
+        },
+      },
+      meta: {
+        ...meta,
+        sizeGb: verifiedSizeGb,
+        sizeLabel: verifiedSizeLabel,
+        verifiedHttpStatus: probe.status,
+        verifiedTotalBytes: probe.totalBytes,
+        verifiedContentType: probe.contentType,
+      },
+    };
+  };
+
+  const verifyDebridPool = async (poolResult) => {
+    const isCloudRender = Boolean(process.env.RENDER);
+    const probeTimeoutMs = Math.min(timeoutBudget, 3500);
+    const verifiedStreams = [];
+    const verifiedMeta = [];
+    let rejectedCount = 0;
+
+    const freshItems = [];
+    for (let i = 0; i < poolResult.streams.length; i++) {
+      const url = poolResult.streams[i].url;
+      if (alreadyProbedUrls.has(url)) continue;
+      alreadyProbedUrls.add(url);
+      freshItems.push({ candidate: poolResult.streams[i], meta: poolResult.selectedMeta[i] || {} });
+    }
+
+    // Probe in parallel batches of 4 while strictly preserving ranked quality order
+    const BATCH_SIZE = 4;
+    for (let start = 0; start < freshItems.length && verifiedStreams.length < desiredCount; start += BATCH_SIZE) {
+      const batch = freshItems.slice(start, start + BATCH_SIZE);
+      const results = await Promise.all(
+        batch.map((item) => verifySingleCandidate(item.candidate, item.meta, isCloudRender, probeTimeoutMs))
+      );
+      for (const res of results) {
+        if (res && verifiedStreams.length < desiredCount) {
+          verifiedStreams.push(res.stream);
+          verifiedMeta.push(res.meta);
+        } else if (!res) {
+          rejectedCount += 1;
+        }
+      }
+    }
+    return { verifiedStreams, verifiedMeta, rejectedCount };
+  };
 
   let finalStreams = filtered.streams;
   let finalMeta = filtered.selectedMeta;
   let rejectedUnverifiedDebrid = 0;
 
-  // Live server-side Real-Debrid verification:
-  // - On cloud/Render (process.env.RENDER): verify 302 Location redirects to a real debrid CDN host without downloading bytes from cloud IP.
-  // - Locally: follow redirects with Range: bytes=0-1023 and assert >= 50 MB real video file (blocking placeholder downloading.mp4 videos).
-  if (hasDebrid && !simulateTimeout && filtered.streams.length > 0) {
-    const isCloudRender = Boolean(process.env.RENDER);
-    const verifiedStreams = [];
-    const verifiedMeta = [];
-    for (let i = 0; i < filtered.streams.length && verifiedStreams.length < desiredCount; i++) {
-      const candidate = filtered.streams[i];
-      const meta = filtered.selectedMeta[i] || {};
+  if (hasDebrid && !simulateTimeout) {
+    let pass1 =
+      filtered.streams.length > 0
+        ? await verifyDebridPool(filtered)
+        : { verifiedStreams: [], verifiedMeta: [], rejectedCount: 0 };
+    rejectedUnverifiedDebrid += pass1.rejectedCount;
 
-      if (isCloudRender) {
-        const redir = await probeRedirectLocation(candidate.url, { timeoutMs: Math.min(timeoutBudget, 4500) });
-        const loc = redir?.location || '';
-        const redirectsToRealDebridCdn =
-          redir &&
-          redir.status >= 300 &&
-          redir.status < 400 &&
-          /real-debrid\.com|alldebrid\.com|premiumize\.me|torbox\.app/i.test(loc) &&
-          !PLACEHOLDER_VIDEO_URL_PATTERN.test(loc);
-
-        if (redirectsToRealDebridCdn) {
-          verifiedStreams.push({
-            ...candidate,
-            behaviorHints: {
-              ...(candidate.behaviorHints || {}),
-              notWebReady: true,
-            },
-          });
-          verifiedMeta.push({ ...meta, verifiedRedirect: true });
-        } else {
-          rejectedUnverifiedDebrid += 1;
+    // Tier-2 Original-Audio Fallback: if Tier-1 strict H.264 found zero cached original-language streams
+    // (e.g., niche non-English series episodes where RD only caches original-audio HEVC), NEVER serve a foreign dub.
+    if (pass1.verifiedStreams.length === 0 && mergedRawStreams.length > 0) {
+      const tier2Filtered = filterAndRankStreams(mergedRawStreams, {
+        type,
+        hasDebrid,
+        maxSizeGb: parsedConfig.maxSizeGb,
+        maxResults: poolLimit,
+        allowOriginalHevcFallback: true,
+        allowHardcodedSubFallback: false,
+      });
+      if (tier2Filtered.streams.length > 0) {
+        const pass2 = await verifyDebridPool(tier2Filtered);
+        rejectedUnverifiedDebrid += pass2.rejectedCount;
+        if (pass2.verifiedStreams.length > 0) {
+          filtered = tier2Filtered;
+          pass1 = pass2;
         }
-        continue;
-      }
-
-      const probe = await probeVideoUrl(candidate.url, { timeoutMs: Math.min(timeoutBudget, 4500) });
-      const isOkStatus = probe && (probe.status === 200 || probe.status === 206);
-      const isCleanUrl =
-        probe &&
-        /^https?:\/\//i.test(probe.effectiveUrl) &&
-        !FORBIDDEN_LOCAL_URL_PATTERN.test(probe.effectiveUrl) &&
-        !PLACEHOLDER_VIDEO_URL_PATTERN.test(probe.effectiveUrl);
-      const isRealFileSize = probe && probe.totalBytes >= MIN_REAL_VIDEO_BYTES;
-      const withinMaxSize =
-        probe && probe.totalBytes <= (parsedConfig.maxSizeGb || 20) * 1024 ** 3 * 1.02;
-
-      if (isOkStatus && isCleanUrl && isRealFileSize && withinMaxSize) {
-        const verifiedSizeGb = +(probe.totalBytes / 1024 ** 3).toFixed(2);
-        const verifiedSizeLabel = formatSizeLabel(verifiedSizeGb);
-        const updatedTitle = candidate.title.replace(/💾\s*[^·\n]+/, `💾 ${verifiedSizeLabel} `);
-        verifiedStreams.push({
-          ...candidate,
-          url: probe.effectiveUrl,
-          title: updatedTitle.replace(/\s+·/g, ' ·'),
-          behaviorHints: {
-            ...(candidate.behaviorHints || {}),
-            notWebReady: true,
-            videoSize: probe.totalBytes,
-          },
-        });
-        verifiedMeta.push({
-          ...meta,
-          sizeGb: verifiedSizeGb,
-          sizeLabel: verifiedSizeLabel,
-          verifiedHttpStatus: probe.status,
-          verifiedTotalBytes: probe.totalBytes,
-          verifiedContentType: probe.contentType,
-        });
-      } else {
-        rejectedUnverifiedDebrid += 1;
       }
     }
-    finalStreams = verifiedStreams;
-    finalMeta = verifiedMeta;
+
+    // Tier-3 Last-Resort Original-Audio Fallback: ONLY when zero clean-sub original-language RD streams exist
+    // (e.g. Fauda S01E10), still 100% blocking all foreign dubs, AVI, CAM, AV1, TrueHD/DTS, >22GB.
+    if (pass1.verifiedStreams.length === 0 && mergedRawStreams.length > 0) {
+      const tier3Filtered = filterAndRankStreams(mergedRawStreams, {
+        type,
+        hasDebrid,
+        maxSizeGb: parsedConfig.maxSizeGb,
+        maxResults: poolLimit,
+        allowOriginalHevcFallback: true,
+        allowHardcodedSubFallback: true,
+      });
+      if (tier3Filtered.streams.length > 0) {
+        const pass3 = await verifyDebridPool(tier3Filtered);
+        rejectedUnverifiedDebrid += pass3.rejectedCount;
+        if (pass3.verifiedStreams.length > 0) {
+          filtered = tier3Filtered;
+          pass1 = pass3;
+        }
+      }
+    }
+
+    finalStreams = pass1.verifiedStreams;
+    finalMeta = pass1.verifiedMeta;
   }
 
   const finalStats = {
@@ -1447,9 +1626,10 @@ const OPENSUBTITLES_PRO_GREEK_BASE =
   'https://opensubtitlesv3-pro.dexter21767.com/eyJsYW5ncyI6WyJncmVlayJdLCJzb3VyY2UiOiJhbGwiLCJhaVRyYW5zbGF0ZWQiOnRydWUsImF1dG9BZGp1c3RtZW50Ijp0cnVlfQ==';
 
 function cleanLabel(text) {
-  if (!text) return 'OpenSubtitles v3 (EL)';
+  if (!text) return 'OpenSubtitles v3';
   return String(text)
     .replace(/[\[\]\(\)]/g, ' ')
+    .replace(/\.(srt|vtt|ass|sub)$/i, '')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1458,13 +1638,34 @@ function tokenizeFilename(filename) {
   return String(filename || '')
     .toLowerCase()
     .split(/[^a-z0-9]+/)
-    .filter((t) => t.length >= 3);
+    .filter((t) => t.length >= 3 && !/^(mkv|mp4|srt|1080p|720p|2160p|x264|h264|x265|hevc|aac|ac3|dd5|ddp|eng)$/.test(t));
+}
+
+function detectReleaseCut(text) {
+  const s = String(text || '').toLowerCase();
+  if (/(?<![a-z0-9])(bluray|blu-ray|bdrip|brrip|remux)(?![a-z0-9])/.test(s)) return 'bluray';
+  if (/(?<![a-z0-9])(web-?dl|nf[\s._-]*web|amzn|atvp|dsnp|hmax)(?![a-z0-9])/.test(s)) return 'webdl';
+  if (/(?<![a-z0-9])(webrip)(?![a-z0-9])/.test(s)) return 'webrip';
+  if (/(?<![a-z0-9])(hdtv|pdtv)(?![a-z0-9])/.test(s)) return 'hdtv';
+  return '';
+}
+
+function extractReleaseGroup(filename) {
+  const cleaned = String(filename || '')
+    .trim()
+    .replace(/\.(mkv|mp4|avi|m4v|srt|vtt)$/i, '');
+  const m = cleaned.match(/-([a-z0-9]{2,16})$/i);
+  if (!m) return '';
+  const grp = m[1].toLowerCase();
+  if (/^(dl|rip|1080p|720p|x264|x265|hevc|aac|ac3|eng|heb|vo)$/.test(grp)) return '';
+  return grp;
 }
 
 /**
  * Handles live Stremio subtitle requests (`/subtitles/:type/:id.json` & `/:extra.json`).
- * Queries real external Greek subtitle providers (OpenSubtitles v3 & OpenSubtitles PRO).
- * Zero mock data: returns empty `{ subtitles: [] }` when no Greek subtitles exist upstream.
+ * Forwards exact videoHash / videoSize / filename to OpenSubtitles v3 & OpenSubtitles PRO
+ * and scores Greek (`ell`) subtitles by release group, source cut (BluRay vs WEB-DL fps timing),
+ * and filename tokens for exact Netflix-grade auto-sync.
  */
 async function handleSubtitlesRequest({
   type,
@@ -1484,9 +1685,13 @@ async function handleSubtitlesRequest({
   }
 
   const parsedExtra = typeof extra === 'string' ? parseExtraParams(extra) : extra || {};
-  const releaseTokens = tokenizeFilename(parsedExtra.filename);
-  const cacheKey = `subtitles:${type}:${cleanId}:${parsedExtra.filename || 'default'}`;
+  const videoFilename = String(parsedExtra.filename || '');
+  const videoHash = String(parsedExtra.videoHash || '');
+  const releaseTokens = tokenizeFilename(videoFilename);
+  const videoCut = detectReleaseCut(videoFilename);
+  const videoGroup = extractReleaseGroup(videoFilename);
 
+  const cacheKey = `subtitles:${type}:${cleanId}:${videoHash || ''}:${videoFilename || 'default'}`;
   if (cache) {
     const cached = cache.get(cacheKey);
     if (cached) {
@@ -1499,8 +1704,13 @@ async function handleSubtitlesRequest({
   }
 
   const timeoutBudget = Math.min(Number(httpTimeoutMs) || 4500, 5000);
-  const osV3Url = `https://opensubtitles-v3.strem.io/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(cleanId)}.json`;
-  const osProUrl = `${OPENSUBTITLES_PRO_GREEK_BASE}/subtitles/${encodeURIComponent(type)}/${encodeURIComponent(cleanId)}.json`;
+  const encodedType = encodeURIComponent(type);
+  const encodedId = encodeURIComponent(cleanId);
+  const cleanExtraSegment = typeof extra === 'string' ? extra.replace(/^\/+|\/+$/g, '') : '';
+  const extraPath = cleanExtraSegment ? `/${cleanExtraSegment}` : '';
+
+  const osV3Url = `https://opensubtitles-v3.strem.io/subtitles/${encodedType}/${encodedId}${extraPath}.json`;
+  const osProUrl = `${OPENSUBTITLES_PRO_GREEK_BASE}/subtitles/${encodedType}/${encodedId}${extraPath}.json`;
 
   const [v3Resp, proResp] = await Promise.all([
     fetchJsonWithTimeout(osV3Url, { timeoutMs: timeoutBudget }),
@@ -1522,17 +1732,39 @@ async function handleSubtitlesRequest({
       if (seenUrls.has(subUrl)) continue;
       seenUrls.add(subUrl);
 
-      const fileMeta = cleanLabel(
-        sub.subtitleFileName || sub.movieReleaseName || sub.label || sourceName
-      );
-      const lowerMeta = fileMeta.toLowerCase();
+      const rawMeta = sub.subtitleFileName || sub.movieReleaseName || sub.label || sourceName;
+      const fileMeta = cleanLabel(rawMeta);
+      const lowerMeta = `${fileMeta} ${sub.id || ''}`.toLowerCase();
+
       let tokenMatches = 0;
       for (const tok of releaseTokens) {
         if (lowerMeta.includes(tok)) tokenMatches++;
       }
 
-      const isSrt = lowerMeta.endsWith('.srt') || subUrl.includes('subencoding-stremio-utf8');
-      const score = priorityBoost + tokenMatches * 50 + (isSrt ? 20 : 0);
+      const subCut = detectReleaseCut(lowerMeta);
+      const subGroup = extractReleaseGroup(rawMeta);
+      const isGroupMatch = Boolean(videoGroup && (subGroup === videoGroup || lowerMeta.includes(videoGroup)));
+      const isCutMatch = Boolean(videoCut && subCut && videoCut === subCut);
+      const isCutMismatch = Boolean(videoCut && subCut && videoCut !== subCut);
+      const isHashMatch = Boolean(
+        videoHash && (sub.m === 'hash' || sub.matchedBy === 'hash' || lowerMeta.includes(videoHash.toLowerCase()))
+      );
+      const isUtf8Srt = subUrl.includes('subencoding-stremio-utf8') || /\.srt(?:\?|$)/i.test(subUrl);
+      const isHearingImpaired = /\b(sdh|cc|hi|hearing[\s._-]*impaired)\b/i.test(lowerMeta);
+
+      const score =
+        priorityBoost +
+        (isHashMatch ? 260 : 0) +
+        (isGroupMatch ? 220 : 0) +
+        (isCutMatch ? 160 : isCutMismatch ? -80 : 0) +
+        tokenMatches * 45 +
+        (isUtf8Srt ? 30 : 0) -
+        (isHearingImpaired ? 60 : 0);
+
+      const isExactSync = isHashMatch || isGroupMatch || isCutMatch || tokenMatches >= 2;
+      const syncPrefix = isExactSync
+        ? '🇬🇷 Ελληνικά (Exact Sync · BestPlay)'
+        : '🇬🇷 Ελληνικά (BestPlay)';
 
       candidates.push({
         score,
@@ -1540,17 +1772,17 @@ async function handleSubtitlesRequest({
           id: String(sub.id || `el-${candidates.length + 1}`),
           url: subUrl,
           lang: 'ell',
-          label: `Ελληνικά · ${fileMeta}`,
+          label: `${syncPrefix} · ${fileMeta}`,
         },
       });
     }
   };
 
   collect(v3Resp?.subtitles, 'OpenSubtitles v3', 100);
-  collect(proResp?.subtitles, 'OpenSubtitles PRO Auto-Sync', 50);
+  collect(proResp?.subtitles, 'OpenSubtitles PRO Auto-Sync', 55);
 
   candidates.sort((a, b) => b.score - a.score);
-  const payload = { subtitles: candidates.map((c) => c.entry) };
+  const payload = { subtitles: candidates.slice(0, 5).map((c) => c.entry) };
 
   if (cache && payload.subtitles.length > 0) {
     cache.set(cacheKey, payload, cacheTtlMs);
